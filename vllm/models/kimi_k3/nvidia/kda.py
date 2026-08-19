@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
+from dataclasses import replace
 
 import torch
 from einops import rearrange
@@ -26,6 +27,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     is_conv_state_dim_first,
 )
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+    causal_conv1d_checkpoint_state,
     causal_conv1d_fn,
     causal_conv1d_update,
 )
@@ -39,6 +41,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.kimi_k3.nvidia.kda_metadata import (
+    FLASHKDA_CHUNK_SIZE,
     KimiK3KDAAttentionBackend,
     KimiK3KDAMetadata,
 )
@@ -46,6 +49,7 @@ from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.v1.attention.backend import AttentionBackend
+from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
@@ -191,7 +195,9 @@ def _flashkda_prefill(
     out: torch.Tensor,
     final_state: torch.Tensor,
     workspace: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    checkpoint_state: torch.Tensor | None = None,
+    checkpoint_offsets: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     import vllm._flashkda_C  # noqa: F401
 
     # FlashKDA hardcodes dense Q/K/V/G strides. Beta may be row-strided because
@@ -213,8 +219,10 @@ def _flashkda_prefill(
         initial_state.contiguous(),
         final_state,
         cu_seqlens.contiguous(),
+        checkpoint_state,
+        checkpoint_offsets.contiguous() if checkpoint_offsets is not None else None,
     )
-    return out, final_state
+    return out, final_state, checkpoint_state
 
 
 def resolve_kda_prefill_backend(
@@ -277,6 +285,46 @@ def _make_decode_norm_weight_loader(
 
 
 class KimiK3DeltaAttention(GatedDeltaNetAttention):
+    def _causal_conv1d_prefill_with_checkpoint(
+        self,
+        x: torch.Tensor,
+        conv_state: torch.Tensor,
+        conv_weight: torch.Tensor,
+        has_initial_state: torch.Tensor,
+        state_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        metadata: KimiK3KDAMetadata,
+    ) -> torch.Tensor:
+        checkpoint_rows = metadata.checkpoint_rows
+        checkpoint_offsets = metadata.checkpoint_offsets
+        checkpoint_state_indices = metadata.checkpoint_state_indices
+        checkpoint_source_state_indices = metadata.checkpoint_source_state_indices
+        assert checkpoint_rows is not None
+        assert checkpoint_offsets is not None
+        assert checkpoint_state_indices is not None
+        assert checkpoint_source_state_indices is not None
+        causal_conv1d_checkpoint_state(
+            x.transpose(0, 1),
+            conv_state,
+            query_start_loc,
+            checkpoint_rows,
+            checkpoint_offsets,
+            checkpoint_source_state_indices,
+            checkpoint_state_indices,
+            has_initial_state,
+        )
+        return causal_conv1d_fn(
+            x.transpose(0, 1),
+            conv_weight,
+            None,
+            activation="silu",
+            conv_states=conv_state,
+            has_initial_state=has_initial_state,
+            cache_indices=state_indices,
+            query_start_loc=query_start_loc,
+            metadata=metadata,
+        ).transpose(0, 1)
+
     def get_attn_backend(self) -> type[AttentionBackend]:
         return KimiK3KDAAttentionBackend
 
@@ -463,6 +511,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             self._flashkda_buffer_specs = (
                 ((1, T, H, D), self.model_config.dtype),
                 ((N, H, D, D), self.get_state_dtype()[1]),
+                ((N, H, D, D), self.get_state_dtype()[1]),
                 ((workspace_size,), torch.uint8),
             )
 
@@ -505,6 +554,15 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> MambaSpec:
+        spec = super().get_kv_cache_spec(vllm_config)
+        assert isinstance(spec, MambaSpec)
+        return replace(
+            spec,
+            num_prefill_checkpoint_blocks=int(self.kda_prefill_backend == "flashkda"),
+            prefill_checkpoint_alignment=FLASHKDA_CHUNK_SIZE,
+        )
 
     def forward(
         self,
@@ -742,6 +800,19 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     state: torch.Tensor,
                     weight: torch.Tensor,
                 ) -> torch.Tensor:
+                    assert has_initial_state is not None
+                    assert non_spec_state_indices_tensor is not None
+                    assert non_spec_query_start_loc is not None
+                    if m.checkpoint_rows is not None:
+                        return self._causal_conv1d_prefill_with_checkpoint(
+                            x,
+                            state,
+                            weight,
+                            has_initial_state,
+                            non_spec_state_indices_tensor,
+                            non_spec_query_start_loc,
+                            m,
+                        )
                     return causal_conv1d_fn(
                         x.transpose(0, 1),
                         weight,
@@ -772,7 +843,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 if self.kda_prefill_backend == "flashkda":
                     assert self.gate_lower_bound is not None
                     assert self._flashkda_buffer_specs is not None
-                    workspace_out, final_state, workspace = (
+                    workspace_out, final_state, checkpoint_state, workspace = (
                         current_workspace_manager().get_simultaneous(
                             *self._flashkda_buffer_specs
                         )
@@ -783,6 +854,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     (
                         core_attn_out_non_spec,
                         last_recurrent_state,
+                        exported_checkpoint_state,
                     ) = _flashkda_prefill(
                         q=q_ns,
                         k=k_ns,
@@ -797,7 +869,21 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         out=flashkda_out,
                         final_state=final_state[: initial_state.shape[0]],
                         workspace=workspace,
+                        checkpoint_state=(
+                            checkpoint_state[: initial_state.shape[0]]
+                            if m.checkpoint_rows is not None
+                            else None
+                        ),
+                        checkpoint_offsets=m.checkpoint_offsets,
                     )
+                    if m.checkpoint_rows is not None:
+                        assert m.checkpoint_state_indices is not None
+                        assert exported_checkpoint_state is not None
+                        recurrent_state[m.checkpoint_state_indices] = (
+                            exported_checkpoint_state[m.checkpoint_rows].to(
+                                recurrent_state.dtype
+                            )
+                        )
                 else:
                     (
                         core_attn_out_non_spec,

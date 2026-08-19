@@ -146,6 +146,9 @@ from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.mamba_checkpoint_utils import (
+    make_mamba_checkpoint_metadata_cpu,
+)
 from vllm.v1.worker.utils import (
     KVBlockZeroer,
     copy_kv_cache_blocks_inplace,
@@ -1262,6 +1265,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # prompt_lens is only used in R-SWA case.
             prompt_lens = self.req_states.prompt_len.gpu[idx_mapping]
 
+        mamba_checkpoint_offsets_cpu = None
+        mamba_checkpoint_state_indices_by_group_cpu = None
+        if scheduler_output.mamba_checkpoint_block_ids is not None:
+            assert self.pcp_manager is None, (
+                "Mamba checkpoint export does not support PCP"
+            )
+            (
+                mamba_checkpoint_offsets_cpu,
+                mamba_checkpoint_state_indices_by_group_cpu,
+            ) = make_mamba_checkpoint_metadata_cpu(
+                req_ids=req_ids,
+                num_reqs_padded=num_reqs_padded,
+                num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                checkpoints=scheduler_output.mamba_checkpoint_block_ids,
+            )
+
         input_batch = InputBatch(
             req_ids=req_ids,
             num_reqs=num_reqs,
@@ -1294,6 +1313,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cu_num_logits_np=cu_num_logits_np,
             has_structured_output_reqs=scheduler_output.has_structured_output_requests,
             prompt_lens=prompt_lens,
+            mamba_checkpoint_offsets_cpu=mamba_checkpoint_offsets_cpu,
+            mamba_checkpoint_state_indices_by_group_cpu=(
+                mamba_checkpoint_state_indices_by_group_cpu
+            ),
             max_query_len=(
                 int(num_scheduled_tokens_upper_bound.max())
                 if adaptive_verification is not None

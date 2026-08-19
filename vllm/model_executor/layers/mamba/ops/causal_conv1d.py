@@ -13,6 +13,102 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 
 
+@triton.jit
+def _causal_conv1d_checkpoint_state_kernel(
+    x_ptr,
+    conv_states_ptr,
+    query_start_loc_ptr,
+    checkpoint_rows_ptr,
+    checkpoint_offsets_ptr,
+    source_state_indices_ptr,
+    checkpoint_state_indices_ptr,
+    has_initial_state_ptr,
+    stride_x_dim: tl.constexpr,
+    stride_x_token: tl.constexpr,
+    stride_state_seq: tl.constexpr,
+    stride_state_dim: tl.constexpr,
+    stride_state_token: tl.constexpr,
+    num_features: tl.constexpr,
+    STATE_LEN: tl.constexpr,
+    NP2_STATE_LEN: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    checkpoint_idx = tl.program_id(0)
+    feature = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    state_token = tl.arange(0, NP2_STATE_LEN)
+
+    row = tl.load(checkpoint_rows_ptr + checkpoint_idx)
+    offset = tl.load(checkpoint_offsets_ptr + row)
+    sequence_start = tl.load(query_start_loc_ptr + row)
+    source_state_idx = tl.load(source_state_indices_ptr + checkpoint_idx)
+    checkpoint_state_idx = tl.load(checkpoint_state_indices_ptr + checkpoint_idx)
+    has_initial_state = tl.load(has_initial_state_ptr + row).to(tl.int1)
+
+    relative_x = offset - STATE_LEN + state_token
+    from_x = relative_x >= 0
+    valid = (feature[None, :] < num_features) & (state_token[:, None] < STATE_LEN)
+    x = tl.load(
+        x_ptr
+        + feature[None, :] * stride_x_dim
+        + (sequence_start + relative_x[:, None]) * stride_x_token,
+        mask=valid & from_x[:, None],
+        other=0.0,
+    )
+    initial_state = tl.load(
+        conv_states_ptr
+        + source_state_idx * stride_state_seq
+        + feature[None, :] * stride_state_dim
+        + (STATE_LEN + relative_x[:, None]) * stride_state_token,
+        mask=valid & (~from_x[:, None]) & has_initial_state,
+        other=0.0,
+    )
+    value = tl.where(from_x[:, None], x, initial_state)
+    tl.store(
+        conv_states_ptr
+        + checkpoint_state_idx * stride_state_seq
+        + feature[None, :] * stride_state_dim
+        + state_token[:, None] * stride_state_token,
+        value,
+        mask=valid,
+    )
+
+
+def causal_conv1d_checkpoint_state(
+    x: torch.Tensor,
+    conv_states: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    checkpoint_rows: torch.Tensor,
+    checkpoint_offsets: torch.Tensor,
+    source_state_indices: torch.Tensor,
+    checkpoint_state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor,
+) -> None:
+    """Save the conv history at fine prefix-cache boundaries."""
+    assert x.ndim == 2 and conv_states.ndim == 3
+    state_len = conv_states.shape[2]
+    grid = (checkpoint_rows.numel(), triton.cdiv(x.shape[0], 256))
+    _causal_conv1d_checkpoint_state_kernel[grid](
+        x,
+        conv_states,
+        query_start_loc,
+        checkpoint_rows,
+        checkpoint_offsets,
+        source_state_indices,
+        checkpoint_state_indices,
+        has_initial_state,
+        x.stride(0),
+        x.stride(1),
+        conv_states.stride(0),
+        conv_states.stride(1),
+        conv_states.stride(2),
+        x.shape[0],
+        STATE_LEN=state_len,
+        NP2_STATE_LEN=triton.next_power_of_2(state_len),
+        BLOCK_N=256,
+        num_warps=4,
+    )
+
+
 @triton.jit(do_not_specialize_on_alignment=["num_cache_lines"])
 def _causal_conv1d_fwd_kernel(  # continuous batching
     # Pointers to matrices

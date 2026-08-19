@@ -272,6 +272,10 @@ class SchedulerOutput:
     # tail (mamba "align" CoW target). None unless partial hash hits are active.
     partial_tail_offloads: dict[str, list[tuple[int, int, int]]] | None = None
 
+    # Mamba state snapshots materialized inside this model forward:
+    # group_id -> request_id -> (state_block_id, model-input-relative offset).
+    mamba_checkpoint_block_ids: dict[int, dict[str, tuple[int, int]]] | None = None
+
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import math
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -53,7 +54,7 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -324,6 +325,24 @@ class Scheduler(SchedulerInterface):
             and self.hash_block_size < self.block_size
             and self.kv_cache_manager.coordinator.enable_partial_hash_hits
         )
+        checkpoint_granularity = (
+            self.hash_block_size if self.mamba_partial_cache_hit else self.block_size
+        )
+        checkpoint_alignments = [
+            group.kv_cache_spec.prefill_checkpoint_alignment
+            for group in kv_cache_config.kv_cache_groups
+            if isinstance(group.kv_cache_spec, MambaSpec)
+        ]
+        self.mamba_prefill_checkpoint_alignment = math.lcm(*checkpoint_alignments)
+        self.mamba_has_prefill_checkpoint_blocks = self.has_mamba_layers and all(
+            not isinstance(group.kv_cache_spec, MambaSpec)
+            or (
+                group.kv_cache_spec.num_prefill_checkpoint_blocks > 0
+                and checkpoint_granularity % self.mamba_prefill_checkpoint_alignment
+                == 0
+            )
+            for group in kv_cache_config.kv_cache_groups
+        )
 
         # Counts of non-empty steps scheduled / processed. update_from_output
         # is called once per scheduled step in FIFO order, so these stay in sync.
@@ -398,19 +417,31 @@ class Scheduler(SchedulerInterface):
             last_cache_position = max(last_cache_position - block_size, 0)
 
         end = start + num_new_tokens
+        checkpoint_alignment = getattr(self, "mamba_prefill_checkpoint_alignment", 1)
+        has_prefill_checkpoint_blocks = (
+            getattr(self, "mamba_has_prefill_checkpoint_blocks", False)
+            and start % checkpoint_alignment == 0
+        )
         # Invariant: slot p holds the state after exactly (p + 1) * block_size
         # tokens. State is written at chunk ends, so chunk ends must be block
         # aligned. Exempt: the prompt's last chunk, whose slot decode advances
         # to the boundary. A block too wide for one chunk advances sub-block
         # and re-aligns at the next boundary.
         if end < prefill_end:
-            max_prefill_tokens = self.max_num_scheduled_tokens
-            long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
-            if long_prefill_threshold > 0:
-                max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
-            aligned_end = end // block_size * block_size
-            if aligned_end > start or block_size <= max_prefill_tokens:
-                end = aligned_end
+            if has_prefill_checkpoint_blocks:
+                # Keep chunk starts aligned to the backend's export granularity.
+                # This costs at most alignment - 1 tokens without adding a step.
+                end = end // checkpoint_alignment * checkpoint_alignment
+            else:
+                max_prefill_tokens = self.max_num_scheduled_tokens
+                long_prefill_threshold = (
+                    self.scheduler_config.long_prefill_token_threshold
+                )
+                if long_prefill_threshold > 0:
+                    max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
+                aligned_end = end // block_size * block_size
+                if aligned_end > start or block_size <= max_prefill_tokens:
+                    end = aligned_end
 
         next_block_boundary = (start // block_size + 1) * block_size
         tail_boundary = (
@@ -436,6 +467,10 @@ class Scheduler(SchedulerInterface):
             if start < request.shared_prefix_boundary < end
             else 0,
         )
+        if has_prefill_checkpoint_blocks:
+            # Backend export replaces prompt-tail and physical-page stops.
+            # Preserve only a shared-prefix junction needed by a sibling.
+            stops = (0, 0, 0, stops[3])
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
@@ -1267,6 +1302,10 @@ class Scheduler(SchedulerInterface):
                 scheduled_encoder_inputs
             )
 
+        mamba_checkpoint_block_ids = (
+            self.kv_cache_manager.take_mamba_checkpoint_block_ids() or None
+        )
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -1286,6 +1325,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             kv_cache_block_copies=pending_kv_cache_block_copies,
             partial_tail_offloads=pending_partial_tail_offloads,
+            mamba_checkpoint_block_ids=mamba_checkpoint_block_ids,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
         )
@@ -1744,6 +1784,11 @@ class Scheduler(SchedulerInterface):
         kv_connector_output = model_runner_output.kv_connector_output
         ec_connector_output = model_runner_output.ec_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+
+        if scheduler_output.mamba_checkpoint_block_ids:
+            self.kv_cache_manager.mark_mamba_checkpoint_blocks_ready(
+                scheduler_output.mamba_checkpoint_block_ids
+            )
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.

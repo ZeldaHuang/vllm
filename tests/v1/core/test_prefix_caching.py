@@ -4333,3 +4333,166 @@ def test_swa_shared_prefix_reuse_under_zero_retention():
     assert last_req_hit(retention=0, pin=False) == 0
     # retention=0 with the pin keeps the junction window -> reuse restored.
     assert last_req_hit(retention=0, pin=True) == 4 * block_size
+
+
+@pytest.mark.parametrize(
+    ("hash_block_size", "use_eagle", "expected_checkpoint"),
+    [
+        (128, False, 9984),
+        (128, True, 9856),
+        (1536, False, 9216),
+        (1536, True, 7680),
+    ],
+)
+def test_mamba_backend_checkpoint_supports_partial_nonpartial_and_eagle(
+    hash_block_size: int,
+    use_eagle: bool,
+    expected_checkpoint: int,
+) -> None:
+    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+
+    mamba_block_size = 1536
+    config = KVCacheConfig(
+        num_blocks=128,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=hash_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float16,
+                ),
+                is_eagle_group=use_eagle,
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=mamba_block_size,
+                    shapes=((1, 1),),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                    num_prefill_checkpoint_blocks=1,
+                    prefill_checkpoint_alignment=16,
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=20000,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        use_eagle=use_eagle,
+    )
+    mamba_manager = next(
+        m
+        for m in manager.coordinator.single_type_managers
+        if isinstance(m, MambaManager)
+    )
+    num_tokens = 10000
+    request = make_request(
+        "checkpoint", list(range(num_tokens)), hash_block_size, sha256
+    )
+    checkpoint_block = mamba_manager.allocate_checkpoint_block(
+        request,
+        num_tokens,
+        num_scheduled_tokens=num_tokens,
+        checkpoint_granularity=(
+            hash_block_size if hash_block_size < mamba_block_size else mamba_block_size
+        ),
+        drop_eagle_block=use_eagle,
+    )
+    assert checkpoint_block is not None
+    checkpoints = mamba_manager.take_mamba_checkpoint_block_ids()
+    checkpoint_block_id, checkpoint_offset = checkpoints[request.request_id]
+    assert checkpoint_block_id == checkpoint_block.block_id
+    assert checkpoint_offset == expected_checkpoint
+
+    _, hit_tokens = mamba_manager.find_longest_cache_hit(
+        block_hashes=request.block_hashes,
+        max_length=expected_checkpoint,
+        kv_cache_group_ids=[mamba_manager.kv_cache_group_id],
+        block_pool=manager.block_pool,
+        kv_cache_spec=mamba_manager.kv_cache_spec,
+        drop_eagle_block=False,
+        alignment_tokens=(
+            hash_block_size if hash_block_size < mamba_block_size else mamba_block_size
+        ),
+    )
+    assert hit_tokens == 0
+
+    mamba_manager.mark_mamba_checkpoint_blocks_ready({checkpoint_block_id})
+    hit_blocks, hit_tokens = mamba_manager.find_longest_cache_hit(
+        block_hashes=request.block_hashes,
+        max_length=expected_checkpoint,
+        kv_cache_group_ids=[mamba_manager.kv_cache_group_id],
+        block_pool=manager.block_pool,
+        kv_cache_spec=mamba_manager.kv_cache_spec,
+        drop_eagle_block=False,
+        alignment_tokens=(
+            hash_block_size if hash_block_size < mamba_block_size else mamba_block_size
+        ),
+    )
+    assert hit_tokens == expected_checkpoint
+    assert hit_blocks[0][-1].block_id == checkpoint_block_id
+
+
+def test_mamba_backend_checkpoint_rejects_misaligned_kernel_offset() -> None:
+    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+
+    hash_block_size = 24
+    config = KVCacheConfig(
+        num_blocks=128,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=hash_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float16,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=1536,
+                    shapes=((1, 1),),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                    num_prefill_checkpoint_blocks=1,
+                    prefill_checkpoint_alignment=16,
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=20000,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+    mamba_manager = next(
+        m
+        for m in manager.coordinator.single_type_managers
+        if isinstance(m, MambaManager)
+    )
+    num_tokens = 9935
+    request = make_request(
+        "misaligned-checkpoint",
+        list(range(num_tokens)),
+        hash_block_size,
+        sha256,
+    )
+    assert (
+        mamba_manager.allocate_checkpoint_block(
+            request,
+            num_tokens,
+            num_scheduled_tokens=num_tokens,
+            checkpoint_granularity=hash_block_size,
+        )
+        is None
+    )

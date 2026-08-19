@@ -527,6 +527,12 @@ class CommonAttentionMetadata:
     decode rows (assumes every draft was accepted). Not safe for kernels
     that need exact per-row context lengths on decode rows."""
 
+    mamba_checkpoint_offsets_cpu: torch.Tensor | None = None
+    """Per-request checkpoint offsets relative to packed model inputs."""
+
+    mamba_checkpoint_state_indices_cpu: torch.Tensor | None = None
+    """Per-request destination Mamba state block indices for one cache group."""
+
     mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None
     """PrefixLM bidirectional ranges for multimodal tokens. Maps
     request index to list of (start, end) token position ranges

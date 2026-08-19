@@ -14,6 +14,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    MambaManager,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
 )
@@ -416,6 +417,26 @@ class KVCacheCoordinator(ABC):
         for manager in self.single_type_managers:
             manager.new_step_starts()
 
+    def take_mamba_checkpoint_block_ids(
+        self,
+    ) -> dict[int, dict[str, tuple[int, int]]]:
+        """Drain pending Mamba checkpoint block IDs by group and request."""
+        ids_by_group: dict[int, dict[str, tuple[int, int]]] = {}
+        for group_id, manager in enumerate(self.single_type_managers):
+            ids = manager.take_mamba_checkpoint_block_ids()
+            if ids:
+                ids_by_group[group_id] = ids
+        return ids_by_group
+
+    def mark_mamba_checkpoint_blocks_ready(
+        self, checkpoints: dict[int, dict[str, tuple[int, int]]]
+    ) -> None:
+        for group_id, req_to_checkpoint in checkpoints.items():
+            block_ids = {block_id for block_id, _ in req_to_checkpoint.values()}
+            self.single_type_managers[group_id].mark_mamba_checkpoint_blocks_ready(
+                block_ids
+            )
+
 
 class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
     """
@@ -711,6 +732,23 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             if group.use_eagle:
                 for gid in group.group_ids:
                     self.single_type_managers[gid].use_eagle = True
+
+    def allocate_mamba_checkpoint_blocks(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        num_scheduled_tokens: int,
+    ) -> None:
+        checkpoint_granularity = self._cache_hit_alignment_tokens
+        for manager in self.single_type_managers:
+            if isinstance(manager, MambaManager):
+                manager.allocate_checkpoint_block(
+                    request,
+                    num_computed_tokens,
+                    num_scheduled_tokens,
+                    checkpoint_granularity=checkpoint_granularity,
+                    drop_eagle_block=bool(self.eagle_group_ids),
+                )
 
     def _align_cacheable(self, num_tokens: int) -> int:
         """Largest prefix of ``num_tokens`` a future cache hit could match.

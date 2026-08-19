@@ -676,6 +676,14 @@ class SingleTypeKVCacheManager(ABC):
     def new_step_starts(self) -> None:
         return None
 
+    def take_mamba_checkpoint_block_ids(self) -> dict[str, tuple[int, int]]:
+        """Return request IDs mapped to checkpoint block IDs and offsets."""
+        return {}
+
+    def mark_mamba_checkpoint_blocks_ready(self, block_ids: set[int]) -> None:
+        """Publish backend checkpoints after their GPU writes complete."""
+        return None
+
 
 class FullAttentionManager(SingleTypeKVCacheManager):
     supports_fine_grained_hash_lookup: ClassVar[bool] = True
@@ -1279,6 +1287,14 @@ class MambaManager(SingleTypeKVCacheManager):
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
+        self.use_prefill_checkpoint = (
+            kv_cache_spec.num_prefill_checkpoint_blocks > 0
+            and self.mamba_cache_mode == "align"
+        )
+        self._pending_checkpoint_blocks: dict[str, tuple[KVCacheBlock, int]] = {}
+        self._inflight_checkpoint_blocks: dict[
+            int, tuple[KVCacheBlock, Request, int]
+        ] = {}
         if self.mamba_cache_mode == "align":
             # Mapping from request ID to the index of the block
             # allocated in the previous step
@@ -1542,7 +1558,8 @@ class MambaManager(SingleTypeKVCacheManager):
             num_evictable_computed_blocks = self._get_num_evictable_blocks(
                 new_computed_blocks
             )
-            return num_new_blocks + num_evictable_computed_blocks
+            checkpoint_block = int(self.use_prefill_checkpoint)
+            return num_new_blocks + num_evictable_computed_blocks + checkpoint_block
 
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
@@ -1695,7 +1712,10 @@ class MambaManager(SingleTypeKVCacheManager):
         retention_interval: int | None = None,
     ) -> None:
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
-        super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
+        if not self.use_prefill_checkpoint or num_tokens % self.block_size == 0:
+            super().cache_blocks(
+                request, num_tokens, retention_interval=retention_interval
+            )
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
         if self.mamba_cache_mode == "align":
             partial_hash = self._cache_partial_tail_block(request, num_tokens)
@@ -1715,6 +1735,96 @@ class MambaManager(SingleTypeKVCacheManager):
 
     def new_step_starts(self) -> None:
         self.cached_blocks_this_step.clear()
+
+    def allocate_checkpoint_block(
+        self,
+        request: Request,
+        num_tokens: int,
+        num_scheduled_tokens: int,
+        checkpoint_granularity: int,
+        drop_eagle_block: bool = False,
+    ) -> KVCacheBlock | None:
+        assert isinstance(self.kv_cache_spec, MambaSpec)
+        if not self.use_prefill_checkpoint:
+            return None
+        if num_tokens != request.num_prompt_tokens:
+            return None
+
+        checkpoint_tokens = (
+            num_tokens // checkpoint_granularity * checkpoint_granularity
+        )
+        if drop_eagle_block:
+            checkpoint_tokens -= checkpoint_granularity
+        num_tokens_after_checkpoint = num_tokens - checkpoint_tokens
+        checkpoint_offset = num_scheduled_tokens - num_tokens_after_checkpoint
+        if not 0 < checkpoint_offset < num_scheduled_tokens:
+            return None
+        if checkpoint_offset % self.kv_cache_spec.prefill_checkpoint_alignment != 0:
+            return None
+
+        request_id = request.request_id
+        assert request_id not in self._pending_checkpoint_blocks
+        hash_block_size = self.block_pool.hash_block_size
+        assert checkpoint_tokens % hash_block_size == 0
+        num_hash_blocks = checkpoint_tokens // hash_block_size
+        assert 0 < num_hash_blocks <= len(request.block_hashes)
+        block_hash = request.block_hashes[num_hash_blocks - 1]
+        if self.block_pool.get_cached_block(block_hash, [self.kv_cache_group_id]):
+            return None
+
+        block = self.block_pool.get_new_blocks(1)[0]
+        self._pending_checkpoint_blocks[request_id] = (block, checkpoint_offset)
+        self._inflight_checkpoint_blocks[block.block_id] = (
+            block,
+            request,
+            checkpoint_tokens,
+        )
+        return block
+
+    def take_mamba_checkpoint_block_ids(self) -> dict[str, tuple[int, int]]:
+        checkpoints = {
+            request_id: (block.block_id, checkpoint_offset)
+            for request_id, (
+                block,
+                checkpoint_offset,
+            ) in self._pending_checkpoint_blocks.items()
+        }
+        self._pending_checkpoint_blocks = {}
+        return checkpoints
+
+    def mark_mamba_checkpoint_blocks_ready(self, block_ids: set[int]) -> None:
+        ready_checkpoints = [
+            checkpoint
+            for block_id in block_ids
+            if (checkpoint := self._inflight_checkpoint_blocks.pop(block_id, None))
+            is not None
+        ]
+        ready_blocks = []
+        for block, request, checkpoint_tokens in ready_checkpoints:
+            if checkpoint_tokens % self.block_size == 0:
+                num_full_blocks = checkpoint_tokens // self.block_size
+                checkpoint_blocks = [self.block_pool.null_block] * num_full_blocks
+                checkpoint_blocks[-1] = block
+                self.block_pool.cache_full_blocks(
+                    request=request,
+                    blocks=checkpoint_blocks,
+                    num_cached_blocks=num_full_blocks - 1,
+                    num_full_blocks=num_full_blocks,
+                    block_size=self.block_size,
+                    kv_cache_group_id=self.kv_cache_group_id,
+                )
+            else:
+                checkpoint_hash = self.block_pool.cache_partial_block(
+                    request=request,
+                    block=block,
+                    num_tokens=checkpoint_tokens,
+                    kv_cache_group_id=self.kv_cache_group_id,
+                    block_size=self.block_size,
+                )
+                assert checkpoint_hash is not None
+            ready_blocks.append(block)
+        if ready_blocks:
+            self.block_pool.free_blocks(ready_blocks)
 
     def _cache_partial_tail_block(
         self,

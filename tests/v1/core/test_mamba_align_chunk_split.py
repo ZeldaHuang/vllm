@@ -78,6 +78,7 @@ def _split(
     num_new_tokens: int,
     use_eagle: bool = True,
     partial_hit: bool = False,
+    has_prefill_checkpoint: bool = False,
 ) -> int:
     """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
     stub = SimpleNamespace(
@@ -88,8 +89,43 @@ def _split(
         # `prefix_match_unit` finer than the block size (#46384).
         mamba_partial_cache_hit=partial_hit,
         hash_block_size=ATTN_BLOCK_SIZE,
+        mamba_has_prefill_checkpoint_blocks=has_prefill_checkpoint,
+        mamba_prefill_checkpoint_alignment=16,
     )
     return Scheduler._mamba_block_aligned_split(stub, request, num_new_tokens)
+
+
+@pytest.mark.parametrize("use_eagle", [False, True])
+@pytest.mark.parametrize("partial_hit", [False, True])
+def test_backend_checkpoint_removes_extra_prefill_step(
+    use_eagle: bool, partial_hit: bool
+) -> None:
+    """A backend checkpoint keeps the whole prompt in one model forward."""
+    prompt_len = 3602
+    (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
+    assert (
+        _split(
+            request,
+            prompt_len,
+            use_eagle=use_eagle,
+            partial_hit=partial_hit,
+            has_prefill_checkpoint=True,
+        )
+        == prompt_len
+    )
+
+
+def test_backend_checkpoint_aligns_intermediate_chunks_to_kernel() -> None:
+    (request,) = create_requests(1, num_tokens=3602, block_size=ATTN_BLOCK_SIZE)
+    assert (
+        _split(
+            request,
+            1001,
+            use_eagle=False,
+            has_prefill_checkpoint=True,
+        )
+        == 992
+    )
 
 
 def _run_chunked_prefill(

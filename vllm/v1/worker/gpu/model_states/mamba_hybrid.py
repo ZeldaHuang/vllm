@@ -33,13 +33,26 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     is_prefilling: torch.Tensor
     num_accepted_tokens: torch.Tensor | None = None
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
+    checkpoint_offsets_cpu: torch.Tensor | None = None
+    checkpoint_state_indices_by_group_cpu: dict[int, torch.Tensor] | None = None
 
     def get_extra_common_attn_kwargs(
         self,
         kv_cache_group_id: int,
         num_reqs: int,
     ) -> dict[str, Any]:
-        return {"is_prefilling": self.is_prefilling[:num_reqs]}
+        kwargs: dict[str, Any] = {"is_prefilling": self.is_prefilling[:num_reqs]}
+        if self.checkpoint_offsets_cpu is not None:
+            kwargs["mamba_checkpoint_offsets_cpu"] = self.checkpoint_offsets_cpu[
+                :num_reqs
+            ]
+        if self.checkpoint_state_indices_by_group_cpu is not None:
+            state_indices = self.checkpoint_state_indices_by_group_cpu.get(
+                kv_cache_group_id
+            )
+            if state_indices is not None:
+                kwargs["mamba_checkpoint_state_indices_cpu"] = state_indices[:num_reqs]
+        return kwargs
 
     def get_extra_attn_kwargs(
         self,
@@ -270,6 +283,10 @@ class MambaHybridModelState(DefaultModelState):
             is_prefilling=is_prefilling,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+            checkpoint_offsets_cpu=input_batch.mamba_checkpoint_offsets_cpu,
+            checkpoint_state_indices_by_group_cpu=(
+                input_batch.mamba_checkpoint_state_indices_by_group_cpu
+            ),
         )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,

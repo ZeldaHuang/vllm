@@ -226,6 +226,9 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.mamba_checkpoint_utils import (
+    make_mamba_checkpoint_metadata_cpu,
+)
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
     check_ubatch_thresholds,
@@ -2367,6 +2370,9 @@ class GPUModelRunner(
         num_scheduled_tokens: dict[str, int] | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
+        mamba_checkpoint_block_ids: (
+            dict[int, dict[str, tuple[int, int]]] | None
+        ) = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         Returns:
@@ -2450,6 +2456,19 @@ class GPUModelRunner(
             seq_lens_cpu = None
             num_computed_tokens_cpu = None
 
+        mamba_checkpoint_offsets_cpu = None
+        mamba_checkpoint_state_indices_by_group_cpu = None
+        if num_scheduled_tokens is not None and mamba_checkpoint_block_ids is not None:
+            (
+                mamba_checkpoint_offsets_cpu,
+                mamba_checkpoint_state_indices_by_group_cpu,
+            ) = make_mamba_checkpoint_metadata_cpu(
+                req_ids=self.input_batch.req_ids[:num_reqs],
+                num_reqs_padded=num_reqs_padded,
+                num_scheduled_tokens=num_scheduled_tokens,
+                checkpoints=mamba_checkpoint_block_ids,
+            )
+
         # Compute mm_prefix bidirectional ranges before building
         # attention metadata so builders handle them during build().
         # By default, ranges exceeding sliding_window are skipped to prevent
@@ -2514,6 +2533,7 @@ class GPUModelRunner(
             slot_mapping=slot_mapping_gid_0,
             causal=True,
             is_prefilling=is_prefilling,
+            mamba_checkpoint_offsets_cpu=mamba_checkpoint_offsets_cpu,
             positions=self.positions[:num_tokens_padded],
             mm_req_doc_ranges=req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
@@ -2644,6 +2664,10 @@ class GPUModelRunner(
             if kv_cache_gid > 0:
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
+            if mamba_checkpoint_state_indices_by_group_cpu is not None:
+                cm.mamba_checkpoint_state_indices_cpu = (
+                    mamba_checkpoint_state_indices_by_group_cpu.get(kv_cache_gid)
+                )
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(
@@ -4510,6 +4534,9 @@ class GPUModelRunner(
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     slot_mappings=slot_mappings_by_group,
+                    mamba_checkpoint_block_ids=(
+                        scheduler_output.mamba_checkpoint_block_ids
+                    ),
                 )
             )
 

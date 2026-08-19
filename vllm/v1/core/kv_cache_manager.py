@@ -564,6 +564,12 @@ class KVCacheManager:
             request.num_tokens,
         )
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
+        if isinstance(self.coordinator, HybridKVCacheCoordinator):
+            self.coordinator.allocate_mamba_checkpoint_blocks(
+                request,
+                num_tokens_to_cache,
+                num_scheduled_tokens=num_new_tokens,
+            )
 
         return self.create_kv_cache_blocks(new_blocks)
 
@@ -881,6 +887,16 @@ class KVCacheManager:
                     (group_id, block.block_id, boundary_tokens)
                 )
         return offloads
+
+    def take_mamba_checkpoint_block_ids(
+        self,
+    ) -> dict[int, dict[str, tuple[int, int]]]:
+        return self.coordinator.take_mamba_checkpoint_block_ids()
+
+    def mark_mamba_checkpoint_blocks_ready(
+        self, checkpoints: dict[int, dict[str, tuple[int, int]]]
+    ) -> None:
+        self.coordinator.mark_mamba_checkpoint_blocks_ready(checkpoints)
 
     def new_step_starts(self) -> None:
         """Notify the coordinator that a new step is starting."""

@@ -38,6 +38,8 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import MambaSpec
 
+FLASHKDA_CHUNK_SIZE = 16
+
 if TYPE_CHECKING:
     from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
         KDARecoverSSMCommitContext,
@@ -242,6 +244,20 @@ def stage_spec_decode_metadata(
     )
 
 
+def _validate_checkpoint_alignment(
+    num_computed_tokens: int,
+    offset: int,
+    prefix_match_unit: int | None,
+) -> int:
+    checkpoint_pos = num_computed_tokens + offset
+    if prefix_match_unit is not None:
+        assert checkpoint_pos % prefix_match_unit == 0
+    assert offset % FLASHKDA_CHUNK_SIZE == 0, (
+        "K3 Mamba checkpoints must align to FlashKDA chunks"
+    )
+    return checkpoint_pos
+
+
 @dataclass
 class KDARecoverSSMAlignMetadata:
     block_table: torch.Tensor
@@ -263,6 +279,10 @@ class KimiK3KDAMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
     recoverssm_context: "KDARecoverSSMCommitContext | None" = field(
         default=None, repr=False, compare=False
     )
+    checkpoint_offsets: torch.Tensor | None = None
+    checkpoint_rows: torch.Tensor | None = None
+    checkpoint_state_indices: torch.Tensor | None = None
+    checkpoint_source_state_indices: torch.Tensor | None = None
 
     def commit_recoverssm_state(
         self, num_accepted_tokens: torch.Tensor
@@ -351,6 +371,8 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
         m = common_attn_metadata
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu
+        checkpoint_offsets_cpu = m.mamba_checkpoint_offsets_cpu
+        checkpoint_state_indices_cpu = m.mamba_checkpoint_state_indices_cpu
         assert isinstance(self.kv_cache_spec, MambaSpec)
         # Equivalent PyTorch "align" path:
         #   start = ((seq_lens - 1) // block_size).clamp_(min=0)
@@ -402,6 +424,8 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
             spec_query_start_loc = None
             non_spec_query_start_loc = query_start_loc
             non_spec_query_start_loc_cpu = query_start_loc_cpu
+            non_spec_checkpoint_offsets_cpu = checkpoint_offsets_cpu
+            non_spec_checkpoint_state_indices_cpu = checkpoint_state_indices_cpu
             num_accepted_tokens = None
         else:
             assert spec_sequence_masks_cpu is not None
@@ -461,6 +485,8 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
                 spec_query_start_loc = query_start_loc[: num_spec_decodes + 1]
                 non_spec_query_start_loc = None
                 non_spec_query_start_loc_cpu = None
+                non_spec_checkpoint_offsets_cpu = None
+                non_spec_checkpoint_state_indices_cpu = None
                 num_accepted_tokens = num_accepted_tokens[:num_spec_decodes]
             else:
                 query_lens = query_start_loc.diff()
@@ -532,6 +558,17 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
                     non_spec_query_start_loc = None
                     non_spec_query_start_loc_cpu = None
 
+                non_spec_checkpoint_offsets_cpu = (
+                    checkpoint_offsets_cpu[active_non_spec_mask_cpu]
+                    if checkpoint_offsets_cpu is not None
+                    else None
+                )
+                non_spec_checkpoint_state_indices_cpu = (
+                    checkpoint_state_indices_cpu[active_non_spec_mask_cpu]
+                    if checkpoint_state_indices_cpu is not None
+                    else None
+                )
+
                 num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
 
             if self.use_recoverssm:
@@ -556,6 +593,61 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
             )
         else:
             has_initial_state = None
+
+        checkpoint_rows_cpu: list[int] = []
+        if (
+            non_spec_query_start_loc_cpu is not None
+            and non_spec_checkpoint_offsets_cpu is not None
+            and non_spec_checkpoint_state_indices_cpu is not None
+        ):
+            non_spec_num_computed_tokens_cpu = m.compute_num_computed_tokens().cpu()
+            if spec_sequence_masks_cpu is not None:
+                non_spec_num_computed_tokens_cpu = non_spec_num_computed_tokens_cpu[
+                    active_non_spec_mask_cpu
+                ]
+            for row_idx in range(non_spec_query_start_loc_cpu.numel() - 1):
+                start = int(non_spec_query_start_loc_cpu[row_idx].item())
+                end = int(non_spec_query_start_loc_cpu[row_idx + 1].item())
+                if start == end:
+                    continue
+                offset = int(non_spec_checkpoint_offsets_cpu[row_idx].item())
+                state_idx = int(non_spec_checkpoint_state_indices_cpu[row_idx].item())
+                if state_idx >= 0 and 0 < offset < end - start:
+                    _validate_checkpoint_alignment(
+                        int(non_spec_num_computed_tokens_cpu[row_idx].item()),
+                        offset,
+                        self.vllm_config.cache_config.prefix_match_unit,
+                    )
+                    checkpoint_rows_cpu.append(row_idx)
+
+        checkpoint_offsets = None
+        checkpoint_rows = None
+        checkpoint_state_indices = None
+        checkpoint_source_state_indices = None
+        if checkpoint_rows_cpu:
+            checkpoint_rows_cpu_tensor = torch.tensor(
+                checkpoint_rows_cpu, dtype=torch.int64
+            )
+            checkpoint_rows = async_tensor_h2d(
+                checkpoint_rows_cpu_tensor,
+                device=query_start_loc.device,
+            )
+            assert non_spec_checkpoint_offsets_cpu is not None
+            checkpoint_offsets = async_tensor_h2d(
+                non_spec_checkpoint_offsets_cpu.to(dtype=query_start_loc.dtype),
+                device=query_start_loc.device,
+            )
+            assert non_spec_checkpoint_state_indices_cpu is not None
+            checkpoint_state_indices = async_tensor_h2d(
+                non_spec_checkpoint_state_indices_cpu[checkpoint_rows_cpu_tensor].to(
+                    torch.int64
+                ),
+                device=query_start_loc.device,
+            )
+            assert non_spec_state_indices_tensor is not None
+            checkpoint_source_state_indices = non_spec_state_indices_tensor[
+                checkpoint_rows
+            ].long()
 
         # Prepare per-request tensors for cudagraph replay. num_actual_tokens
         # may be token-padded, while state/query/acceptance metadata is indexed
@@ -647,6 +739,10 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
+            checkpoint_offsets=checkpoint_offsets,
+            checkpoint_rows=checkpoint_rows,
+            checkpoint_state_indices=checkpoint_state_indices,
+            checkpoint_source_state_indices=checkpoint_source_state_indices,
         )
 
 

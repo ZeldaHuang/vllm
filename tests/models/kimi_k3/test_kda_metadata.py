@@ -15,10 +15,12 @@ from tests.v1.attention.utils import (
 from vllm.config import SpeculativeConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.models.kimi_k3.nvidia.kda_metadata import (
+    FLASHKDA_CHUNK_SIZE,
     KimiK3KDAAttentionBackend,
     KimiK3KDAMetadata,
     KimiK3KDAMetadataBuilder,
     _mamba_get_block_table_tensor,
+    _validate_checkpoint_alignment,
     stage_spec_decode_metadata,
 )
 from vllm.v1.attention.backend import AttentionMetadataBuilder
@@ -46,6 +48,39 @@ PRUNED_METADATA_FIELDS = {
     "prefill_has_initial_state",
     "spec_sequence_masks",
 }
+
+
+@pytest.mark.parametrize(
+    ("num_computed_tokens", "offset", "prefix_match_unit", "expected"),
+    [
+        (98288, 21520, 64, 119808),
+        (0, 1536, None, 1536),
+    ],
+)
+def test_checkpoint_alignment_supports_partial_and_nonpartial_cache(
+    num_computed_tokens: int,
+    offset: int,
+    prefix_match_unit: int | None,
+    expected: int,
+) -> None:
+    assert (
+        _validate_checkpoint_alignment(
+            num_computed_tokens=num_computed_tokens,
+            offset=offset,
+            prefix_match_unit=prefix_match_unit,
+        )
+        == expected
+    )
+    assert offset % FLASHKDA_CHUNK_SIZE == 0
+
+
+def test_checkpoint_alignment_rejects_unaligned_kernel_offset() -> None:
+    with pytest.raises(AssertionError, match="FlashKDA chunks"):
+        _validate_checkpoint_alignment(
+            num_computed_tokens=98286,
+            offset=21522,
+            prefix_match_unit=128,
+        )
 
 
 def _assert_matches_shared_gdn(
