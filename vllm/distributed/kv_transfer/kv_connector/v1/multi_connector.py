@@ -197,6 +197,23 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         # load the request from (if any).
         self._requests_to_connector: dict[str, int] = {}
 
+        # Req_ids whose current load attempt's recv completion was already
+        # forwarded to the scheduler; later duplicates are dropped.
+        self._recv_completion_delivered: set[str] = set()
+
+        # Tombstones for requests that finished while a load completion was
+        # still outstanding; exactly one more recv completion may pass so the
+        # scheduler's deferred block free can proceed. A tombstone is held
+        # only until that completion arrives (the scheduler itself holds the
+        # full request under the same assumption), so no cap is needed.
+        self._finished_awaiting_recv: set[str] = set()
+
+        # Same as above, but for requests that finished with async saves
+        # outstanding: exactly one more send completion may pass. A request
+        # may sit in both tombstone sets at once (aborted mid-load with
+        # saves pending); the two directions are independent.
+        self._finished_awaiting_send: set[str] = set()
+
         # Keeps track of *additional* remaining async saves (beyond 1) to be
         # finished per request. Not needed for async loads since we only allow
         # a single connector to load.
@@ -409,6 +426,15 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
         chosen_connector = self._requests_to_connector.get(request.request_id, -1)
+        if chosen_connector >= 0 and num_external_tokens > 0:
+            # The load is only now actually issued (allocation succeeded and
+            # the request transitions to WAITING_FOR_REMOTE_KVS). Reset the
+            # recv completion state for the new attempt here, not in
+            # get_num_new_matched_tokens: requests that matched but could not
+            # be allocated yet must keep dropping late completions of the
+            # previous attempt.
+            self._recv_completion_delivered.discard(request.request_id)
+            self._finished_awaiting_recv.discard(request.request_id)
         for i, c in enumerate(self._connectors):
             if i == chosen_connector:
                 # Forward call to the chosen connector (if any).
@@ -454,6 +480,57 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         finally:
             # restore kv_connector_worker_meta
             connector_output.kv_connector_worker_meta = multi_connector_worker_meta
+
+        # Filter stale/duplicate finished_recving completions in place so the
+        # scheduler never sees them (sub-connectors above still observe the
+        # raw output for their own bookkeeping).
+        if connector_output.finished_recving:
+            filtered: set[str] = set()
+            for req_id in connector_output.finished_recving:
+                if req_id in self._requests_to_connector:
+                    if req_id in self._recv_completion_delivered:
+                        logger.warning(
+                            "Dropping duplicate finished_recving completion "
+                            "for request %s.",
+                            req_id,
+                        )
+                        continue
+                    self._recv_completion_delivered.add(req_id)
+                    filtered.add(req_id)
+                elif req_id in self._finished_awaiting_recv:
+                    # Expected final completion for an already-finished
+                    # request; consume the tombstone.
+                    self._finished_awaiting_recv.discard(req_id)
+                    filtered.add(req_id)
+                else:
+                    logger.warning(
+                        "Dropping stale finished_recving completion for "
+                        "unknown/completed request %s.",
+                        req_id,
+                    )
+            connector_output.finished_recving = filtered
+
+        # finished_sending is stricter than finished_recving: on the
+        # scheduler's contract a send completion is only ever valid for a
+        # finished request whose blocks were retained pending async saves
+        # (for a live request it would trip the scheduler's
+        # RequestStatus.is_finished assert, and for an unknown one the
+        # req_id-in-requests assert), so there is no pass-through case.
+        if connector_output.finished_sending:
+            filtered_sending: set[str] = set()
+            for req_id in connector_output.finished_sending:
+                if req_id in self._finished_awaiting_send:
+                    # Expected final completion for an already-finished
+                    # request; consume the tombstone.
+                    self._finished_awaiting_send.discard(req_id)
+                    filtered_sending.add(req_id)
+                else:
+                    logger.warning(
+                        "Dropping stale finished_sending completion for "
+                        "unknown/completed request %s.",
+                        req_id,
+                    )
+            connector_output.finished_sending = filtered_sending
 
     def get_handshake_metadata(self) -> KVConnectorHandshakeMetadata | None:
         """
@@ -509,7 +586,22 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         if async_saves > 1:
             self._extra_async_saves[request.request_id] = async_saves - 1
 
-        self._requests_to_connector.pop(request.request_id, None)
+        req_id = request.request_id
+        if (
+            self._requests_to_connector.pop(req_id, None) is not None
+            and req_id not in self._recv_completion_delivered
+        ):
+            # The load completion is still outstanding and the scheduler
+            # defers freeing the request's blocks until it arrives, so allow
+            # exactly one more recv completion for this request.
+            self._finished_awaiting_recv.add(req_id)
+        self._recv_completion_delivered.discard(req_id)
+
+        if async_saves > 0:
+            # Async saves are still outstanding and the scheduler defers
+            # freeing the request's blocks until the (merged) send completion
+            # arrives, so allow exactly one more send completion.
+            self._finished_awaiting_send.add(req_id)
 
         return async_saves > 0, kv_txfer_params
 

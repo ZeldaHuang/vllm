@@ -1142,3 +1142,173 @@ def test_multi_connector_mixed_hma_disables_hybrid_kv_cache(monkeypatch):
             assert mc._all_support_hma is False
         finally:
             llm.llm_engine.engine_core.shutdown()
+
+
+def _match_tokens(mc: MultiConnector, req_id: str, connector_idx: int = 0) -> MagicMock:
+    """Simulate the scheduler matching stage for req_id (no allocation yet)."""
+    request = MagicMock()
+    request.request_id = req_id
+    for i, c in enumerate(mc._connectors):
+        c.get_num_new_matched_tokens.return_value = (
+            (16, True) if i == connector_idx else (0, False)
+        )
+    toks, load_async = mc.get_num_new_matched_tokens(request, 0)
+    assert (toks, load_async) == (16, True)
+    return request
+
+
+def _issue_load(mc: MultiConnector, req_id: str, connector_idx: int = 0) -> None:
+    """Simulate the scheduler matching and actually issuing a load for req_id.
+
+    Mirrors Scheduler.schedule(): get_num_new_matched_tokens, then
+    update_state_after_alloc only once allocate_slots succeeded.
+    """
+    request = _match_tokens(mc, req_id, connector_idx)
+    mc.update_state_after_alloc(request, MagicMock(), 16)
+
+
+def _deliver_recv_completions(mc: MultiConnector, *req_ids: str) -> KVConnectorOutput:
+    """Feed finished_recving completions through update_connector_output."""
+    output = KVConnectorOutput(finished_recving=set(req_ids))
+    mc.update_connector_output(output)
+    return output
+
+
+def _finish_request(mc: MultiConnector, req_id: str, async_save: bool = False) -> None:
+    """Simulate the scheduler aborting/finishing a request."""
+    request = MagicMock()
+    request.request_id = req_id
+    for c in mc._connectors:
+        c.request_finished.return_value = (async_save, None)
+    mc.request_finished(request, [])
+
+
+def test_recv_completion_first_passes_duplicate_dropped(mc):
+    """First recv completion for an issued load passes; duplicates are dropped."""
+    _issue_load(mc, "req-1")
+
+    assert _deliver_recv_completions(mc, "req-1").finished_recving == {"req-1"}
+    assert _deliver_recv_completions(mc, "req-1").finished_recving == set()
+
+
+def test_recv_completion_retry_resets_attempt(mc):
+    """A retry re-issuing the load resets the completion state."""
+    _issue_load(mc, "req-1")
+    assert _deliver_recv_completions(mc, "req-1").finished_recving == {"req-1"}
+
+    # Scheduler re-issues the load after a failed attempt.
+    _issue_load(mc, "req-1")
+    assert _deliver_recv_completions(mc, "req-1").finished_recving == {"req-1"}
+    assert _deliver_recv_completions(mc, "req-1").finished_recving == set()
+
+
+def test_recv_completion_match_without_alloc_keeps_dropping(mc):
+    """A re-match without allocation must not reset the completion state.
+
+    Regression: get_num_new_matched_tokens is only the matching stage. If
+    allocate_slots fails afterwards, update_state_after_alloc is never called,
+    no load is issued, and the request stays plain WAITING. A late completion
+    of the previous attempt must still be dropped (otherwise it reaches the
+    scheduler's RequestStatus.is_finished assert and crashes the engine).
+    """
+    _issue_load(mc, "req-1")
+    assert _deliver_recv_completions(mc, "req-1").finished_recving == {"req-1"}
+
+    # Re-match, but allocation fails so update_state_after_alloc is never
+    # called and the request stays plain WAITING.
+    _match_tokens(mc, "req-1")
+    assert _deliver_recv_completions(mc, "req-1").finished_recving == set()
+
+    # Once allocation succeeds the load is issued; the next completion passes.
+    _issue_load(mc, "req-1")
+    assert _deliver_recv_completions(mc, "req-1").finished_recving == {"req-1"}
+
+
+def test_recv_completion_after_finish_with_outstanding_load(mc):
+    """request_finished with an outstanding load: exactly one completion passes.
+
+    The scheduler defers freeing the request's blocks until the completion
+    arrives, so it must not be filtered even though the request is gone.
+    """
+    _issue_load(mc, "req-1")
+    _finish_request(mc, "req-1")
+
+    assert _deliver_recv_completions(mc, "req-1").finished_recving == {"req-1"}
+    assert _deliver_recv_completions(mc, "req-1").finished_recving == set()
+
+
+def test_recv_completion_after_finish_already_delivered(mc):
+    """request_finished after the completion was delivered: drops later ones."""
+    _issue_load(mc, "req-1")
+    assert _deliver_recv_completions(mc, "req-1").finished_recving == {"req-1"}
+    _finish_request(mc, "req-1")
+
+    assert _deliver_recv_completions(mc, "req-1").finished_recving == set()
+
+
+def test_recv_completion_unknown_req_id_dropped(mc):
+    """Completions for req_ids the connector never tracked are dropped."""
+    assert _deliver_recv_completions(mc, "ghost").finished_recving == set()
+
+
+def _deliver_send_completions(mc: MultiConnector, *req_ids: str) -> KVConnectorOutput:
+    """Feed finished_sending completions through update_connector_output."""
+    output = KVConnectorOutput(finished_sending=set(req_ids))
+    mc.update_connector_output(output)
+    return output
+
+
+def test_send_completion_after_finish_with_async_save(mc):
+    """Send completion for a request finished with saves pending passes once.
+
+    The scheduler defers freeing the request's blocks until the merged send
+    completion arrives, so it must not be filtered; a duplicate must be.
+    """
+    _finish_request(mc, "req-1", async_save=True)
+
+    assert _deliver_send_completions(mc, "req-1").finished_sending == {"req-1"}
+    assert _deliver_send_completions(mc, "req-1").finished_sending == set()
+
+
+def test_send_completion_after_finish_without_async_save_dropped(mc):
+    """Send completion for a request finished with no async saves is dropped."""
+    _finish_request(mc, "req-1")
+
+    assert _deliver_send_completions(mc, "req-1").finished_sending == set()
+
+
+def test_send_completion_unknown_req_id_dropped(mc):
+    """Send completions for req_ids the connector never tracked are dropped."""
+    output = _deliver_send_completions(mc, "ghost")
+    assert output.finished_sending == set()
+    # finished_recving stays None when it was None.
+    assert output.finished_recving is None
+
+
+def test_recv_and_send_tombstones_independent(mc):
+    """A request aborted mid-load with saves pending gets one of each direction."""
+    _issue_load(mc, "req-1")
+    _finish_request(mc, "req-1", async_save=True)
+
+    assert _deliver_recv_completions(mc, "req-1").finished_recving == {"req-1"}
+    assert _deliver_send_completions(mc, "req-1").finished_sending == {"req-1"}
+    assert _deliver_recv_completions(mc, "req-1").finished_recving == set()
+    assert _deliver_send_completions(mc, "req-1").finished_sending == set()
+
+
+def test_sub_connectors_observe_unfiltered_output(mc):
+    """Sub-connectors see the raw completions; filtering happens after fan-out."""
+    seen: list[set[str] | None] = []
+
+    def _record(output: KVConnectorOutput):
+        recving = output.finished_recving
+        seen.append(set(recving) if recving else None)
+
+    mc._connectors[0].update_connector_output.side_effect = _record
+    mc._connectors[1].update_connector_output.side_effect = _record
+
+    output = KVConnectorOutput(finished_recving={"ghost"})
+    mc.update_connector_output(output)
+
+    assert seen == [{"ghost"}, {"ghost"}]
+    assert output.finished_recving == set()
