@@ -1285,15 +1285,33 @@ def test_send_completion_unknown_req_id_dropped(mc):
     assert output.finished_recving is None
 
 
-def test_recv_and_send_tombstones_independent(mc):
-    """A request aborted mid-load with saves pending gets one of each direction."""
+def test_first_completion_dropped_when_send_pending(mc):
+    """Aborted mid-load with a save pending, recv arrives first: it is dropped
+    and only the send completion (the last pending direction) passes.
+
+    The scheduler deletes the request on the first completion it sees
+    (_free_blocks semantics are identical for both directions), so letting
+    the earlier one through would crash the engine when the later arrives.
+    """
     _issue_load(mc, "req-1")
     _finish_request(mc, "req-1", async_save=True)
 
-    assert _deliver_recv_completions(mc, "req-1").finished_recving == {"req-1"}
+    assert _deliver_recv_completions(mc, "req-1").finished_recving == set()
     assert _deliver_send_completions(mc, "req-1").finished_sending == {"req-1"}
     assert _deliver_recv_completions(mc, "req-1").finished_recving == set()
     assert _deliver_send_completions(mc, "req-1").finished_sending == set()
+
+
+def test_first_completion_dropped_when_recv_pending(mc):
+    """Same as above with the arrival order swapped: the send completion is
+    dropped and the later recv completion passes."""
+    _issue_load(mc, "req-1")
+    _finish_request(mc, "req-1", async_save=True)
+
+    assert _deliver_send_completions(mc, "req-1").finished_sending == set()
+    assert _deliver_recv_completions(mc, "req-1").finished_recving == {"req-1"}
+    assert _deliver_send_completions(mc, "req-1").finished_sending == set()
+    assert _deliver_recv_completions(mc, "req-1").finished_recving == set()
 
 
 def test_sub_connectors_observe_unfiltered_output(mc):
