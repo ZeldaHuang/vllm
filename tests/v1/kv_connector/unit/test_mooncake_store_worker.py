@@ -150,6 +150,7 @@ def _make_load_req(
     *,
     token_len: int,
     vllm_cached_tokens: int = 0,
+    load_attempt_id: int = 0,
 ) -> ReqMeta:
     return ReqMeta(
         req_id=req_id,
@@ -161,6 +162,7 @@ def _make_load_req(
             kvpool_cached_tokens=token_len,
             can_load=True,
             token_len=token_len,
+            load_attempt_id=load_attempt_id,
         ),
     )
 
@@ -1048,6 +1050,34 @@ def test_store_recving_thread_reports_failed_block_ids():
     assert thread.get_and_clear_finished_requests() == {"req-a"}
     assert thread.get_and_clear_block_ids_with_load_errors() == {1, 2}
     assert thread.get_and_clear_block_ids_with_load_errors() == set()
+
+
+def test_recv_thread_tags_completion_with_load_attempt_id():
+    # The completion report carries the scheduler-minted attempt id so the
+    # scheduler can match it to the exact load attempt; legacy (attempt 0)
+    # loads report the bare req_id.
+    store = MagicMock()
+    store.batch_get_into_multi_buffers.return_value = [256, 256, 256]
+    thread = _make_store_recving_thread(store)
+
+    thread._handle_request(
+        _make_load_req(
+            "req-a",
+            [b"a0", b"a1", b"a2"],
+            token_len=48,
+            load_attempt_id=7,
+        )
+    )
+    assert thread.get_and_clear_finished_requests() == {"req-a\x007"}
+
+    thread._handle_request(
+        _make_load_req(
+            "req-b",
+            [b"b0", b"b1", b"b2"],
+            token_len=48,
+        )
+    )
+    assert thread.get_and_clear_finished_requests() == {"req-b"}
 
 
 def test_store_recving_thread_reports_failed_block_ids_after_rotation():

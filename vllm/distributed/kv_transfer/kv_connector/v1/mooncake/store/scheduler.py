@@ -5,6 +5,8 @@
 # (vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/).
 """Scheduler-side logic for MooncakeStoreConnector."""
 
+import itertools
+
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
@@ -18,6 +20,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  
     MooncakeStoreWorkerMetadata,
     ReqMeta,
     RequestTracker,
+    split_req_attempt,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import (  # noqa: E501
     LookupKeyClient,
@@ -89,6 +92,19 @@ class MooncakeStoreScheduler:
         self._next_store_job_id = 0
         # store_job_id -> (referenced block ids, ranks yet to report completion)
         self._pinned_saves: dict[int, tuple[list[int], int]] = {}
+
+        # Load-attempt generation. Each load ReqMeta emitted to workers
+        # carries a fresh, engine-monotonic attempt id so a completion can be
+        # matched to the exact attempt that produced it; client reuse of a
+        # req_id can never collide with an older incarnation.
+        self._load_attempt_counter = itertools.count(1)
+        # req_id -> attempt id for loads emitted to workers whose completion
+        # has not been consumed yet.
+        self._inflight_load_attempts: dict[str, int] = {}
+        # req_id -> attempt id for requests that finished with a load still
+        # in flight; the scheduler defers freeing their blocks until the
+        # completion arrives, so exactly one completion must still pass.
+        self._finished_awaiting_load: dict[str, int] = {}
 
     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
         self._gpu_block_pool = gpu_block_pool
@@ -183,6 +199,16 @@ class MooncakeStoreScheduler:
 
         self.load_specs[request.request_id].can_load = True
 
+    def _mint_load_attempt(self, req_id: str, load_spec: LoadSpec) -> None:
+        """Tag a load being emitted to workers with a fresh attempt id."""
+        attempt = next(self._load_attempt_counter)
+        load_spec.load_attempt_id = attempt
+        self._inflight_load_attempts[req_id] = attempt
+        # A new attempt supersedes any tombstone left by a previous
+        # incarnation of this req_id, so a late completion of that
+        # incarnation cannot pass as the new attempt's.
+        self._finished_awaiting_load.pop(req_id, None)
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
@@ -212,6 +238,8 @@ class MooncakeStoreScheduler:
         # Handle new requests
         for request in scheduler_output.scheduled_new_reqs:
             load_spec = self.load_specs.pop(request.req_id, None)
+            if load_spec is not None and load_spec.can_load:
+                self._mint_load_attempt(request.req_id, load_spec)
             num_tokens_to_compute = (
                 request.num_computed_tokens
                 + scheduler_output.num_scheduled_tokens[request.req_id]
@@ -270,6 +298,8 @@ class MooncakeStoreScheduler:
                     else:
                         new_block_ids = (new_block_ids.copy(),)
                     load_spec = self.load_specs.pop(req_id, None)
+                    if load_spec is not None and load_spec.can_load:
+                        self._mint_load_attempt(req_id, load_spec)
                     request_tuple = self._unfinished_requests.get(req_id)
                     request_real = request_tuple[0]  # type: ignore[index]
                     num_tokens_to_compute = (
@@ -355,6 +385,8 @@ class MooncakeStoreScheduler:
                 load_spec = self.load_specs.pop(request_id, None)
                 if not load_spec:
                     continue
+                if load_spec.can_load:
+                    self._mint_load_attempt(request_id, load_spec)
                 num_tokens_to_compute = load_spec.kvpool_cached_tokens
                 request_tracker = RequestTracker(
                     req_id=request_id,
@@ -470,6 +502,51 @@ class MooncakeStoreScheduler:
             del self._pinned_saves[store_job_id]
             # Tail-first, as elsewhere, so the shared prefix is evicted last.
             pool.free_blocks(pool.blocks[bid] for bid in reversed(block_ids))
+
+    def request_finished(self, req_id: str) -> None:
+        """Tombstone a load still in flight when its request finishes.
+
+        The scheduler defers freeing such a request's blocks until the load
+        completion arrives, so exactly one completion must still pass; the
+        tombstone records which attempt may do so. Called from the
+        connector's request_finished hook, which the vllm scheduler invokes
+        before recording req_id in finished_req_ids (Scheduler._free_request),
+        so the finished sweep above never sees the inflight entry.
+        """
+        attempt = self._inflight_load_attempts.pop(req_id, None)
+        if attempt is not None:
+            self._finished_awaiting_load[req_id] = attempt
+
+    def filter_finished_recving(self, finished: set[str]) -> set[str]:
+        """Match tagged load completions to the attempt that produced them.
+
+        Returns clean request ids: the completion of the current attempt
+        passes once, as does the single deferred completion of a request that
+        finished with its load in flight. Stale or duplicate completions are
+        dropped with a warning. Untagged ids (attempt 0, from before attempt
+        tagging) pass through unchanged.
+        """
+        filtered: set[str] = set()
+        for tag in finished:
+            req_id, attempt = split_req_attempt(tag)
+            if attempt == 0:
+                filtered.add(req_id)
+                continue
+            if self._inflight_load_attempts.get(req_id) == attempt:
+                del self._inflight_load_attempts[req_id]
+                filtered.add(req_id)
+                continue
+            if self._finished_awaiting_load.get(req_id) == attempt:
+                del self._finished_awaiting_load[req_id]
+                filtered.add(req_id)
+                continue
+            logger.warning(
+                "Dropping stale/duplicate Mooncake load completion for "
+                "request %s (attempt %d).",
+                req_id,
+                attempt,
+            )
+        return filtered
 
     def has_pending_push_work(self) -> bool:
         """Keep the engine stepping while any store job still holds block refs.

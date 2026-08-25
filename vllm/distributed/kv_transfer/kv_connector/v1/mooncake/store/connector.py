@@ -228,6 +228,8 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
         request: Request,
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.request_finished(request.request_id)
         # An in-flight store job holds its own reference on the blocks it reads,
         # so a finishing request never has to defer freeing them.
         return False, None
@@ -251,6 +253,16 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         assert self.connector_scheduler is not None
+        if connector_output.finished_recving:
+            # Strip load-attempt tags, matching each completion to the attempt
+            # that produced it, so downstream consumers (the watermark/save
+            # handling below, an enclosing MultiConnector's filter, and the
+            # scheduler's assert loops) only ever see clean request ids.
+            connector_output.finished_recving = (
+                self.connector_scheduler.filter_finished_recving(
+                    connector_output.finished_recving
+                )
+            )
         self.connector_scheduler.update_connector_output(connector_output)
 
         kv_cache_events = connector_output.kv_cache_events

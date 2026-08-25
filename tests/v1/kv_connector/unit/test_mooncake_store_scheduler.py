@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import itertools
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +11,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     MooncakeStoreWorkerMetadata,
     ReqMeta,
     RequestTracker,
+    split_req_attempt,
+    tag_req_with_attempt,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.scheduler import (
     MooncakeStoreScheduler,
@@ -43,6 +46,9 @@ def _make_bare_scheduler(
     scheduler._num_workers = 1
     scheduler._next_store_job_id = 0
     scheduler._pinned_saves = {}
+    scheduler._load_attempt_counter = itertools.count(1)
+    scheduler._inflight_load_attempts = {}
+    scheduler._finished_awaiting_load = {}
     return scheduler
 
 
@@ -1047,3 +1053,145 @@ def test_worker_metadata_aggregates_completions_across_ranks():
         MooncakeStoreWorkerMetadata(completed_saves={1: 1, 2: 1})
     )
     assert merged.completed_saves == {1: 2, 2: 1}
+
+
+# Load-attempt generation: each load emitted to workers carries a fresh,
+# engine-monotonic attempt id so a completion can be matched to the exact
+# attempt that produced it.
+
+
+def _issue_pending_load(scheduler: MooncakeStoreScheduler) -> ReqMeta:
+    """Emit a load ReqMeta for req-0 via the pending (unscheduled) path."""
+    _make_pending_load_unfinished_request(
+        scheduler,
+        num_tokens=48,
+        block_hashes=[b"h0", b"h1", b"h2"],
+    )
+    scheduler.load_specs["req-0"] = LoadSpec(
+        vllm_cached_tokens=0,
+        kvpool_cached_tokens=48,
+        can_load=True,
+    )
+    meta = scheduler.build_connector_meta(_make_pending_load_scheduler_output())
+    [req_meta] = meta.requests
+    assert req_meta.load_spec is not None and req_meta.load_spec.can_load
+    return req_meta
+
+
+def test_split_req_attempt_roundtrip():
+    assert split_req_attempt("req-0") == ("req-0", 0)
+    assert split_req_attempt(tag_req_with_attempt("req-0", 0)) == ("req-0", 0)
+    assert split_req_attempt(tag_req_with_attempt("req-0", 42)) == ("req-0", 42)
+
+
+def test_load_retry_mints_incrementing_attempt_ids():
+    scheduler = _make_bare_scheduler()
+    first = _issue_pending_load(scheduler)
+    assert first.load_spec is not None
+    assert first.load_spec.load_attempt_id == 1
+    assert scheduler._inflight_load_attempts == {"req-0": 1}
+
+    # A retry after a load failure reuses the req_id but gets a fresh attempt.
+    second = _issue_pending_load(scheduler)
+    assert second.load_spec is not None
+    assert second.load_spec.load_attempt_id == 2
+    assert scheduler._inflight_load_attempts == {"req-0": 2}
+
+
+def test_current_attempt_completion_passes_exactly_once():
+    scheduler = _make_bare_scheduler()
+    req_meta = _issue_pending_load(scheduler)
+    assert req_meta.load_spec is not None
+    tag = tag_req_with_attempt("req-0", req_meta.load_spec.load_attempt_id)
+
+    assert scheduler.filter_finished_recving({tag}) == {"req-0"}
+    assert scheduler._inflight_load_attempts == {}
+    # An identical duplicate is dropped.
+    assert scheduler.filter_finished_recving({tag}) == set()
+
+
+def test_old_attempt_completion_dropped_after_retry():
+    scheduler = _make_bare_scheduler()
+    first = _issue_pending_load(scheduler)
+    second = _issue_pending_load(scheduler)
+    assert first.load_spec is not None and second.load_spec is not None
+
+    stale = tag_req_with_attempt("req-0", first.load_spec.load_attempt_id)
+    assert scheduler.filter_finished_recving({stale}) == set()
+    current = tag_req_with_attempt("req-0", second.load_spec.load_attempt_id)
+    assert scheduler.filter_finished_recving({current}) == {"req-0"}
+
+
+def test_finished_with_inflight_load_passes_one_completion(caplog_vllm):
+    # A request finished while its load was in flight gets exactly one
+    # completion through the tombstone, so the scheduler's deferred block
+    # free can proceed.
+    scheduler = _make_bare_scheduler()
+    req_meta = _issue_pending_load(scheduler)
+    assert req_meta.load_spec is not None
+    attempt = req_meta.load_spec.load_attempt_id
+
+    scheduler.request_finished("req-0")
+    assert scheduler._inflight_load_attempts == {}
+    assert scheduler._finished_awaiting_load == {"req-0": attempt}
+
+    tag = tag_req_with_attempt("req-0", attempt)
+    assert scheduler.filter_finished_recving({tag}) == {"req-0"}
+    assert scheduler._finished_awaiting_load == {}
+    # A duplicate and a wrong-attempt completion are both dropped.
+    assert scheduler.filter_finished_recving({tag}) == set()
+    wrong = tag_req_with_attempt("req-0", attempt + 1)
+    assert scheduler.filter_finished_recving({wrong}) == set()
+    assert "Dropping stale/duplicate Mooncake load completion" in caplog_vllm.text
+
+
+def test_untagged_completions_pass_through_unchanged():
+    scheduler = _make_bare_scheduler()
+    assert scheduler.filter_finished_recving({"req-x", "req-y"}) == {
+        "req-x",
+        "req-y",
+    }
+    assert scheduler._inflight_load_attempts == {}
+    assert scheduler._finished_awaiting_load == {}
+
+
+def test_req_id_reuse_never_matches_across_generations():
+    scheduler = _make_bare_scheduler()
+    first = _issue_pending_load(scheduler)
+    scheduler.request_finished("req-0")
+    # The client reuses the req_id; the new incarnation mints a fresh,
+    # larger attempt id and supersedes the old one's tombstone.
+    second = _issue_pending_load(scheduler)
+    assert first.load_spec is not None and second.load_spec is not None
+    assert second.load_spec.load_attempt_id > first.load_spec.load_attempt_id
+
+    old = tag_req_with_attempt("req-0", first.load_spec.load_attempt_id)
+    assert scheduler.filter_finished_recving({old}) == set()
+    current = tag_req_with_attempt("req-0", second.load_spec.load_attempt_id)
+    assert scheduler.filter_finished_recving({current}) == {"req-0"}
+
+
+def test_resumed_load_also_mints_attempt_id():
+    # The resumed-from-preemption path emits load ReqMetas too, so it must
+    # tag them like any other emission point.
+    scheduler = _make_bare_scheduler()
+    _make_resumed_unfinished_request(
+        scheduler,
+        token_ids=list(range(48)),
+        block_hashes=[b"h0", b"h1", b"h2"],
+        num_computed_tokens=0,
+    )
+    scheduler.load_specs["req-0"] = LoadSpec(
+        vllm_cached_tokens=0,
+        kvpool_cached_tokens=48,
+        can_load=True,
+    )
+
+    meta = scheduler.build_connector_meta(
+        _make_resumed_scheduler_output(num_scheduled_tokens=48)
+    )
+
+    [req_meta] = meta.requests
+    assert req_meta.load_spec is not None
+    assert req_meta.load_spec.load_attempt_id == 1
+    assert scheduler._inflight_load_attempts == {"req-0": 1}

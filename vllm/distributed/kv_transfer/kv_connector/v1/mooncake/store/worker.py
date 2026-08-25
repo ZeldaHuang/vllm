@@ -48,6 +48,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  
     MooncakeStoreWorkerMetadata,
     PoolKey,
     ReqMeta,
+    tag_req_with_attempt,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.protocol import (  # noqa: E501
     LOOKUP_MSG,
@@ -1170,6 +1171,12 @@ class KVCacheStoreRecvingThread(KVTransferThread):
     def _handle_request(self, req_meta: ReqMeta):
         token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
         req_id = req_meta.req_id
+        # Tag the completion report with the load attempt id so the scheduler
+        # can match it to the exact attempt that produced it.
+        load_attempt_id = (
+            req_meta.load_spec.load_attempt_id if req_meta.load_spec else 0
+        )
+        finished_tag = tag_req_with_attempt(req_id, load_attempt_id)
         mask_num = (
             req_meta.load_spec.vllm_cached_tokens  # type: ignore[union-attr]
             // self.block_size
@@ -1240,7 +1247,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                         oversized_key_bytes,
                         self.disk_offload_buffer_budget_bytes,
                     )
-                    self.set_finished_request(req_id)
+                    self.set_finished_request(finished_tag)
                     self.request_queue.task_done()
                     return
                 load_batches = []
@@ -1318,7 +1325,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 e,
             )
 
-        self.set_finished_request(req_id)
+        self.set_finished_request(finished_tag)
         self.request_queue.task_done()
 
 

@@ -300,6 +300,27 @@ class ChunkedTokenDatabase:
             yield start_idx, end_idx, h
 
 
+# Separates a request id from its load attempt id in worker completion
+# reports. NUL cannot appear in API-level request ids, so the tag is
+# unambiguous.
+_LOAD_ATTEMPT_SEP = "\x00"
+
+
+def tag_req_with_attempt(req_id: str, attempt: int) -> str:
+    """Tag a request id with its load attempt id (no-op for attempt 0)."""
+    if attempt == 0:
+        return req_id
+    return f"{req_id}{_LOAD_ATTEMPT_SEP}{attempt}"
+
+
+def split_req_attempt(tag: str) -> tuple[str, int]:
+    """Split a tagged request id into (req_id, attempt); untagged maps to 0."""
+    req_id, sep, attempt = tag.rpartition(_LOAD_ATTEMPT_SEP)
+    if not sep:
+        return tag, 0
+    return req_id, int(attempt)
+
+
 @dataclass
 class LoadSpec:
     """Specification for loading KV cache from external store."""
@@ -308,6 +329,9 @@ class LoadSpec:
     kvpool_cached_tokens: int
     can_load: bool
     token_len: int = 0
+    # Generation of this load attempt, minted by the scheduler when the load
+    # is emitted to workers. 0 means legacy/untagged.
+    load_attempt_id: int = 0
 
 
 @dataclass
