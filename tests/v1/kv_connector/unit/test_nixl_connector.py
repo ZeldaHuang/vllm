@@ -338,6 +338,10 @@ def test_abort_immediately_remote_prefill_enqueues_empty_recv():
     assert req_meta.remote.request_id == f"prefill-{42}"
     # do_remote_prefill is consumed by request_finished to prevent re-issuing.
     assert request.kv_transfer_params["do_remote_prefill"] is False
+    # The abort cleanup is tagged so the worker's notification is
+    # distinguishable from a real pull completion on the wire.
+    assert request.kv_transfer_params["nixl_abort_cleanup"] is True
+    assert req_meta.remote.abort_cleanup is True
 
 
 @patch(

@@ -220,6 +220,9 @@ class RemoteMeta:
     engine_id: str
     request_id: str
     blocks_expiry_time: float | None = None
+    # The D side aborted before pulling; its worker's notification is a
+    # tagged lease-release, not a pull completion.
+    abort_cleanup: bool = False
 
 
 @dataclass
@@ -295,5 +298,6 @@ class NixlConnectorMetadata(KVConnectorMetadata):
             host=kv_transfer_params["remote_host"],
             port=kv_transfer_params["remote_port"],
             blocks_expiry_time=kv_transfer_params.get("remote_blocks_expiry_time"),
+            abort_cleanup=kv_transfer_params.get("nixl_abort_cleanup", False),
         )
         self.reqs_to_recv[request_id] = req

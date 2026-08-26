@@ -214,12 +214,15 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 remote_request_id=meta.remote.request_id,
                 local_xfer_side_handle=local_xfer_side_handle,
                 remote_xfer_side_handle=remote_xfer_side_handle,
+                abort_cleanup=meta.remote.abort_cleanup,
             )
 
         if self.use_mla and tp_ratio < 0 and len(read_specs) == 1:
             # ..but we still need to notify the other remote ranks that we
             # have the blocks we need so they can update the request state.
             notif_id = f"{meta.remote.request_id}:{self.world_size}".encode()
+            if meta.remote.abort_cleanup:
+                notif_id = b"CANCEL:" + notif_id
             remote_agents = self._remote_agents[meta.remote.engine_id]
             for rank_to_notify, agent in remote_agents.items():
                 if rank_to_notify != (0, read_specs[0].remote_rank):
@@ -233,6 +236,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         remote_request_id: str,
         local_xfer_side_handle: int,
         remote_xfer_side_handle: int,
+        abort_cleanup: bool = False,
     ):
         """
         Post a READ point-to-point xfer request from a single local worker to
@@ -265,6 +269,11 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # Number of D TP workers that will read from dst P. Propagate info
         # on notification so that dst worker can wait before freeing blocks.
         notif_id = f"{remote_request_id}:{self.world_size}".encode()
+        if abort_cleanup:
+            # Abort cleanup (the request never pulled): tag the notification
+            # so the receiver releases the lease without reporting a send
+            # completion for a request it may never have leased.
+            notif_id = b"CANCEL:" + notif_id
 
         # Full prefix cache hit: do not need to read remote blocks,
         # just notify P worker that we have the blocks we need.
@@ -366,6 +375,30 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 # Handle heartbeat messages from D-side.
                 if msg.startswith("HB:"):
                     self._handle_heartbeat(msg[3:])
+                    continue
+
+                # Handle abort-cleanup messages from D-side: the request was
+                # aborted before it ever pulled, so this notification is a
+                # lease release, not a pull completion.
+                if msg.startswith("CANCEL:"):
+                    req_id = msg[len("CANCEL:") :].rsplit(":", 1)[0]
+                    self.consumer_notification_counts_by_req.pop(req_id, None)
+                    if req_id in self._reqs_to_send:
+                        # Release the lease now instead of waiting for expiry,
+                        # and let the scheduler's deferred free proceed via
+                        # the completion.
+                        self._reqs_to_send.pop(req_id, None)
+                        self._reqs_to_process.discard(req_id)
+                        notified_req_ids.add(req_id)
+                    else:
+                        # The request was never leased (e.g. aborted mid-load):
+                        # nothing to free and no completion is owed — reporting
+                        # one would let the scheduler delete the request out
+                        # from under other in-flight transfers.
+                        logger.debug(
+                            "Ignoring abort-cleanup notif for unleased request %s",
+                            req_id,
+                        )
                     continue
 
                 req_id, tp_size = msg.rsplit(":", 1)
