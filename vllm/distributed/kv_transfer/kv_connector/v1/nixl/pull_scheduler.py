@@ -218,6 +218,9 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             # worker side will notify and free blocks in the prefill instance.
             self._reqs_need_recv[request.request_id] = (request, [])
             params["do_remote_prefill"] = False
+            # Tag the abort-cleanup recv so the worker's notification is
+            # distinguishable from a real pull completion on the wire.
+            params["nixl_abort_cleanup"] = True
             return False, None
 
         if is_d_node and not self.is_bidirectional_kv_xfer_enabled:

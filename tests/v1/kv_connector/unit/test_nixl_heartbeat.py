@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for the scheduler-driven heartbeat / lease-renewal system."""
 
+import logging
 import time
+from collections import defaultdict
 from unittest.mock import MagicMock
 
 import pytest
@@ -163,3 +165,112 @@ def test_handle_heartbeat():
     assert w._reqs_to_send["req-b"] >= far_future
     # req-unknown: not added.
     assert "req-unknown" not in w._reqs_to_send
+
+
+# ===================================================================
+# Worker: abort-cleanup ("CANCEL:") notifications
+# ===================================================================
+
+
+def _pull_worker_stub():
+    """Bare pull worker for notif-path tests (no NIXL, no torch)."""
+    from types import SimpleNamespace
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker import (
+        NixlPullConnectorWorker,
+    )
+
+    w = object.__new__(NixlPullConnectorWorker)
+    w.nixl_wrapper = MagicMock()
+    w.world_size = 1
+    w._remote_agents = {"prefill-engine": {(0, 0): "agent_p0"}}
+    w._reqs_to_send = {}
+    w._reqs_to_process = set()
+    w.consumer_notification_counts_by_req = defaultdict(int)
+    topo = MagicMock()
+    topo.tp_ratio.return_value = 1
+    topo.block_size_ratio.return_value = 1
+    topo.get_engine_info.return_value = SimpleNamespace(remote_block_size=16)
+    w.transfer_topo = topo
+    return w
+
+
+def _read_empty_blocks(w, **kwargs) -> None:
+    """Drive the len(local_block_ids) == 0 fast path of _read_blocks."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
+        ReadSpec,
+    )
+
+    w._read_blocks(
+        read_spec=ReadSpec(remote_rank=0, local_block_ids=[], remote_block_ids=[]),
+        dst_engine_id="prefill-engine",
+        request_id="decode-req",
+        remote_request_id="prefill-req",
+        local_xfer_side_handle=0,
+        remote_xfer_side_handle=0,
+        **kwargs,
+    )
+
+
+def test_read_blocks_abort_cleanup_sends_cancel_notif():
+    """Abort cleanup (never pulled) sends a CANCEL-tagged notification so the
+    prefill side can tell it apart from a real pull completion."""
+    w = _pull_worker_stub()
+    _read_empty_blocks(w, abort_cleanup=True)
+    w.nixl_wrapper.send_notif.assert_called_once_with(
+        "agent_p0", notif_msg=b"CANCEL:prefill-req:1"
+    )
+
+
+def test_read_blocks_full_cache_hit_notif_untagged():
+    """A genuine full prefix cache hit keeps the plain notification format."""
+    w = _pull_worker_stub()
+    _read_empty_blocks(w)
+    w.nixl_wrapper.send_notif.assert_called_once_with(
+        "agent_p0", notif_msg=b"prefill-req:1"
+    )
+
+
+def test_get_new_notifs_cancel_releases_lease():
+    """A CANCEL notif for a leased request releases the lease immediately and
+    reports the completion so the scheduler's deferred free can proceed."""
+    w = _pull_worker_stub()
+    w._reqs_to_send["prefill-req"] = time.perf_counter() + 60
+    w._reqs_to_process.add("prefill-req")
+    # Partial consumer count from an earlier, now-moot completion notif.
+    w.consumer_notification_counts_by_req["prefill-req"] = 1
+    w.nixl_wrapper.get_new_notifs.return_value = {"agent_p0": [b"CANCEL:prefill-req:1"]}
+
+    assert w._get_new_notifs() == {"prefill-req"}
+    assert "prefill-req" not in w._reqs_to_send
+    assert "prefill-req" not in w._reqs_to_process
+    assert "prefill-req" not in w.consumer_notification_counts_by_req
+
+
+def test_get_new_notifs_cancel_unleased_is_ignored(caplog_vllm):
+    """A CANCEL notif for a request that was never leased (e.g. aborted while
+    another transfer was still in flight) reports no completion: reporting one
+    would let the scheduler delete the request out from under that transfer."""
+    w = _pull_worker_stub()
+    w.nixl_wrapper.get_new_notifs.return_value = {"agent_p0": [b"CANCEL:ghost:1"]}
+
+    with caplog_vllm.at_level(logging.DEBUG):
+        assert w._get_new_notifs() == set()
+
+    assert not [r for r in caplog_vllm.records if r.levelno >= logging.ERROR]
+    assert w._reqs_to_send == {}
+    assert w._reqs_to_process == set()
+    assert "ghost" not in w.consumer_notification_counts_by_req
+
+
+def test_get_new_notifs_normal_notif_unchanged():
+    """An untagged pull-completion notif for a leased request is handled
+    exactly as before."""
+    w = _pull_worker_stub()
+    w._reqs_to_send["prefill-req"] = time.perf_counter() + 60
+    w._reqs_to_process.add("prefill-req")
+    w.nixl_wrapper.get_new_notifs.return_value = {"agent_p0": [b"prefill-req:1"]}
+
+    assert w._get_new_notifs() == {"prefill-req"}
+    assert "prefill-req" not in w._reqs_to_send
+    assert "prefill-req" not in w._reqs_to_process
