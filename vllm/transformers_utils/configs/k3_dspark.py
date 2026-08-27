@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from transformers import DeepseekV2Config
+from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 
-class K3DSparkConfig(DeepseekV2Config):
+class K3DSparkConfig(KimiLinearConfig):
     """Configuration for a dense MLA DSpark draft model."""
 
     model_type = "k3_dspark"

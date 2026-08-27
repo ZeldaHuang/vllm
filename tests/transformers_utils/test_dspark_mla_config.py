@@ -4,10 +4,13 @@
 import json
 
 import pytest
+from huggingface_hub.errors import StrictDataclassClassValidationError
+from transformers import DeepseekV2Config
 
 from vllm.config import ModelConfig, ParallelConfig, SpeculativeConfig
 from vllm.transformers_utils.config import get_config
 from vllm.transformers_utils.configs.k3_dspark import K3DSparkConfig
+from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 
 def _write_dspark_config(path, **overrides):
@@ -20,6 +23,7 @@ def _write_dspark_config(path, **overrides):
         "num_hidden_layers": 5,
         "num_attention_heads": 64,
         "num_key_value_heads": 64,
+        "head_dim": 64,
         "q_lora_rank": 1536,
         "kv_lora_rank": 512,
         "qk_nope_head_dim": 128,
@@ -65,6 +69,8 @@ def test_dspark_mla_config_loads_from_local_json(tmp_path):
     config = get_config(draft_path, trust_remote_code=False)
 
     assert isinstance(config, K3DSparkConfig)
+    assert isinstance(config, KimiLinearConfig)
+    assert not isinstance(config, DeepseekV2Config)
     assert config.model_type == "k3_dspark"
     assert config.architectures == ["K3DSparkModel"]
     assert config.hidden_act == "silu"
@@ -74,6 +80,26 @@ def test_dspark_mla_config_loads_from_local_json(tmp_path):
     }
     assert config.n_routed_experts == 0
     assert config.draft_vocab_size == config.vocab_size
+
+
+def test_dspark_mla_supports_non_divisible_hidden_size(tmp_path):
+    draft_path = tmp_path / "draft"
+    _write_dspark_config(
+        draft_path,
+        num_attention_heads=96,
+        num_key_value_heads=96,
+    )
+
+    config = get_config(draft_path, trust_remote_code=False)
+
+    assert config.hidden_size == 7168
+    assert config.num_attention_heads == 96
+    assert config.head_dim == 64
+
+
+def test_dspark_mla_preserves_deepseek_v2_architecture_validation():
+    with pytest.raises(StrictDataclassClassValidationError, match="not a multiple"):
+        DeepseekV2Config(hidden_size=7168, num_attention_heads=96)
 
 
 @pytest.mark.parametrize(
